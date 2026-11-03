@@ -35,6 +35,9 @@ jobs:
           sed -i 's/android:label="[^"]*"/android:label="HandWrite AI"/' android/app/src/main/AndroidManifest.xml
           grep -n "minSdk" android/app/build.gradle* || true
 
+      - name: Relax JVM target check (tflite_flutter plugin uses Java 1.8)
+        run: echo "kotlin.jvm.target.validation.mode=warning" >> android/gradle.properties
+
       - run: flutter pub get
 
       - name: Build release APK
