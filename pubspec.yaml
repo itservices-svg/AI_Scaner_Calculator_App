@@ -9,7 +9,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  tflite_flutter: ^0.11.0
+  tflite_flutter: ^0.12.1
 
 dev_dependencies:
   flutter_test:
