@@ -9,13 +9,15 @@ import 'stroke_painter.dart';
 
 class DigitRecognizer {
   late final Interpreter _interp;
+  int _classes = 10; // 11 ho to class 10 = "digit nahi hai"
 
   Future<void> load() async {
     _interp = await Interpreter.fromAsset('assets/digit_model.tflite');
+    _classes = _interp.getOutputTensor(0).shape.last;
   }
 
   /// 28x28 (0..1, white digit on black) pixels ko classify karta hai.
-  /// Returns (digit, confidence).
+  /// Returns (class, confidence). class 10 = digit nahi (sirf 11-class model mein).
   (int, double) classify(Float32List px) {
     final input = [
       List.generate(
@@ -27,10 +29,10 @@ class DigitRecognizer {
   }
 
   (int, double) _predict(List<List<List<List<double>>>> input) {
-    final output = [List<double>.filled(10, 0.0)];
+    final output = [List<double>.filled(_classes, 0.0)];
     _interp.run(input, output);
     var best = 0;
-    for (var i = 1; i < 10; i++) {
+    for (var i = 1; i < _classes; i++) {
       if (output[0][i] > output[0][best]) best = i;
     }
     return (best, output[0][best]);
@@ -92,7 +94,8 @@ class DigitRecognizer {
     final sb = StringBuffer();
     for (final g in _group(strokes)) {
       final input = await _render(g);
-      sb.write(_predict(input).$1);
+      final d = _predict(input).$1;
+      if (d <= 9) sb.write(d);
     }
     return sb.toString();
   }

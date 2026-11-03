@@ -147,7 +147,7 @@ class _ScanPageState extends State<ScanPage> {
           continue;
         }
         final (digit, conf) = widget.recognizer.classify(g.pixels);
-        if (conf < _rejectConf) {
+        if (digit > 9 || conf < _rejectConf) {
           states.add(2);
           continue;
         }
