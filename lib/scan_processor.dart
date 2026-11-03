@@ -56,58 +56,56 @@ class _Comp {
   }
 }
 
+class _CC {
+  final Int32List labels;
+  final List<_Comp> comps;
+  _CC(this.labels, this.comps);
+}
+
+class _Band {
+  final List<ScanGlyph> glyphs;
+  final int lines;
+  final int lastNumberId;
+  _Band(this.glyphs, this.lines, this.lastNumberId);
+}
+
+class _Plan {
+  final double digitH; // andaza: ek digit ki unchai (work image ke pixels)
+  final List<int> cuts; // band kaatne ki y positions (sirf blank gaps par)
+  _Plan(this.digitH, this.cuts);
+}
+
 int _ci(int v, int lo, int hi) => v < lo ? lo : (v > hi ? hi : v);
 
-img.Image _loadResized(Uint8List bytes) {
-  var im = img.decodeImage(bytes);
-  if (im == null) throw Exception('Image parh nahi sakay');
-  im = img.bakeOrientation(im);
-  const maxSide = 1280;
-  if (im.width > maxSide || im.height > maxSide) {
-    im = im.width >= im.height
-        ? img.copyResize(im, width: maxSide)
-        : img.copyResize(im, height: maxSide);
-  }
-  return im;
+img.Image _decode(Uint8List bytes) {
+  final d = img.decodeImage(bytes);
+  if (d == null) throw Exception('Image parh nahi sakay');
+  return img.bakeOrientation(d);
 }
 
-/// Top-level functions taake `compute()` se background isolate mein chal sakein.
-PreparedImage prepareScan(Uint8List bytes) {
-  final im = _loadResized(bytes);
-  return PreparedImage(
-      Uint8List.fromList(img.encodeJpg(im, quality: 80)), im.width, im.height);
+/// Longest side ko `long` pixels par lata hai (chhota karte waqt average).
+img.Image _fit(img.Image im, int long) {
+  final cur = max(im.width, im.height);
+  if (cur == long) return im;
+  final interp =
+      long < cur ? img.Interpolation.average : img.Interpolation.linear;
+  return im.width >= im.height
+      ? img.copyResize(im, width: long, interpolation: interp)
+      : img.copyResize(im, height: long, interpolation: interp);
 }
 
-ScanResult processScan(ScanRequest req) {
-  var im = _loadResized(req.bytes);
-  final fw = im.width;
-  final fh = im.height;
-  final x0 = _ci((req.l * fw).round(), 0, fw - 2);
-  final y0 = _ci((req.t * fh).round(), 0, fh - 2);
-  final x1 = _ci((req.r * fw).round(), x0 + 2, fw);
-  final y1 = _ci((req.b * fh).round(), y0 + 2, fh);
-  if (x1 - x0 < fw || y1 - y0 < fh) {
-    im = img.copyCrop(im, x: x0, y: y0, width: x1 - x0, height: y1 - y0);
-  }
-  // chhota crop ho to bara karo taake digits kaafi pixels len
-  final longSide = im.width > im.height ? im.width : im.height;
-  if (longSide < 640) {
-    im = im.width >= im.height
-        ? img.copyResize(im, width: 800)
-        : img.copyResize(im, height: 800);
-  }
+Uint8List _gray(img.Image im) {
   final w = im.width;
-  final h = im.height;
-  final preview = Uint8List.fromList(img.encodeJpg(im, quality: 80));
-
-  // 1) Grayscale
-  final gray = Uint8List(w * h);
+  final g = Uint8List(w * im.height);
   for (final p in im) {
     final v = 0.299 * p.r + 0.587 * p.g + 0.114 * p.b;
-    gray[p.y * w + p.x] = v < 0 ? 0 : (v > 255 ? 255 : v.round());
+    g[p.y * w + p.x] = v < 0 ? 0 : (v > 255 ? 255 : v.round());
   }
+  return g;
+}
 
-  // 2) Adaptive threshold (local mean, integral image) -> ink mask
+/// Adaptive threshold (local mean, integral image): ink = 1.
+Uint8List _inkMask(Uint8List gray, int w, int h, int rad, int delta) {
   final iw = w + 1;
   final integral = Int32List((w + 1) * (h + 1));
   for (var y = 0; y < h; y++) {
@@ -117,24 +115,26 @@ ScanResult processScan(ScanRequest req) {
       integral[(y + 1) * iw + (x + 1)] = integral[y * iw + (x + 1)] + rowSum;
     }
   }
-  final rad = max(15, min(w, h) ~/ 25);
   final ink = Uint8List(w * h);
   for (var y = 0; y < h; y++) {
-    final y0 = max(0, y - rad);
-    final y1 = min(h - 1, y + rad);
+    final ya = max(0, y - rad);
+    final yb = min(h - 1, y + rad);
     for (var x = 0; x < w; x++) {
-      final x0 = max(0, x - rad);
-      final x1 = min(w - 1, x + rad);
-      final sum = integral[(y1 + 1) * iw + (x1 + 1)] -
-          integral[y0 * iw + (x1 + 1)] -
-          integral[(y1 + 1) * iw + x0] +
-          integral[y0 * iw + x0];
-      final cnt = (x1 - x0 + 1) * (y1 - y0 + 1);
-      if ((gray[y * w + x] + 15) * cnt < sum) ink[y * w + x] = 1;
+      final xa = max(0, x - rad);
+      final xb = min(w - 1, x + rad);
+      final sum = integral[(yb + 1) * iw + (xb + 1)] -
+          integral[ya * iw + (xb + 1)] -
+          integral[(yb + 1) * iw + xa] +
+          integral[ya * iw + xa];
+      final cnt = (xb - xa + 1) * (yb - ya + 1);
+      if ((gray[y * w + x] + delta) * cnt < sum) ink[y * w + x] = 1;
     }
   }
+  return ink;
+}
 
-  // 3) Connected components (8-neighbour)
+/// Connected components (8-neighbour).
+_CC _components(Uint8List ink, int w, int h) {
   final labels = Int32List(w * h);
   final stack = Int32List(w * h);
   final comps = <_Comp>[];
@@ -171,19 +171,180 @@ ScanResult processScan(ScanRequest req) {
     }
     comps.add(_Comp(nextId, l, t, r, b)..area = area);
   }
+  return _CC(labels, comps);
+}
 
-  // 4) Noise / lines / borders filter
-  final minArea = max(25, (w * h * 0.00003).round());
-  var cand = comps
+/// Top-level functions taake `compute()` se background isolate mein chal sakein.
+PreparedImage prepareScan(Uint8List bytes) {
+  var im = _decode(bytes);
+  if (max(im.width, im.height) > 1280) im = _fit(im, 1280);
+  return PreparedImage(
+      Uint8List.fromList(img.encodeJpg(im, quality: 80)), im.width, im.height);
+}
+
+ScanResult processScan(ScanRequest req) {
+  var im = _decode(req.bytes);
+
+  // crop (fractions poori photo ke)
+  final fw = im.width;
+  final fh = im.height;
+  final cx0 = _ci((req.l * fw).round(), 0, fw - 2);
+  final cy0 = _ci((req.t * fh).round(), 0, fh - 2);
+  final cx1 = _ci((req.r * fw).round(), cx0 + 2, fw);
+  final cy1 = _ci((req.b * fh).round(), cy0 + 2, fh);
+  if (cx1 - cx0 < fw || cy1 - cy0 < fh) {
+    im = img.copyCrop(im, x: cx0, y: cy0, width: cx1 - cx0, height: cy1 - cy0);
+  }
+
+  // working size: bohat bari ho to 3200, bohat chhoti ho to 800
+  const maxWork = 3200;
+  final longSide = max(im.width, im.height);
+  var work = im;
+  if (longSide > maxWork) {
+    work = _fit(im, maxWork);
+  } else if (longSide < 640) {
+    work = _fit(im, 800);
+  }
+
+  List<ScanGlyph> single() => _scanBand(work, 0, 0, 0, -1).glyphs;
+
+  var glyphs = <ScanGlyph>[];
+  if (max(work.width, work.height) <= 1500) {
+    glyphs = single();
+  } else {
+    var plan = _plan(work);
+    // digits bare hon to itni resolution ki zaroorat nahi
+    if (plan.digitH > 110) {
+      final f = 80.0 / plan.digitH;
+      final nl = max(1280, (max(work.width, work.height) * f).round());
+      work = _fit(work, nl);
+      plan = _plan(work);
+    }
+    if (max(work.width, work.height) <= 1500) {
+      glyphs = single();
+    } else {
+      // Tiling: bands ke darmiyan cuts sirf blank gaps par hain, is liye
+      // koi number/digit kabhi nahi tootta.
+      final rad = _ci((plan.digitH * 0.75).round(), 12, 80);
+      final minArea = max(12, (plan.digitH * plan.digitH * 0.02).round());
+      final bounds = [0, ...plan.cuts, work.height];
+      var lineBase = 0;
+      var numBase = -1;
+      for (var bi = 0; bi + 1 < bounds.length; bi++) {
+        final y0 = bounds[bi];
+        final y1 = bounds[bi + 1];
+        if (y1 - y0 < 8) continue;
+        final bandIm = bounds.length == 2
+            ? work
+            : img.copyCrop(work, x: 0, y: y0, width: work.width, height: y1 - y0);
+        final out = _scanBand(bandIm, rad, minArea, lineBase, numBase);
+        for (final g in out.glyphs) {
+          glyphs.add(ScanGlyph(g.pixels, g.line, g.numberId, g.left,
+              g.top + y0, g.right, g.bottom + y0, g.rejected));
+        }
+        lineBase += out.lines;
+        numBase = out.lastNumberId;
+      }
+    }
+  }
+
+  final preview = Uint8List.fromList(img.encodeJpg(work, quality: 72));
+  return ScanResult(preview, work.width, work.height, glyphs);
+}
+
+/// Coarse (1/4) nazar se: digit ki unchai ka andaza + band cuts (blank rows).
+_Plan _plan(img.Image work) {
+  const q = 4;
+  final cw = max(8, work.width ~/ q);
+  final ch = max(8, work.height ~/ q);
+  final small = img.copyResize(work,
+      width: cw, height: ch, interpolation: img.Interpolation.average);
+  final gray = _gray(small);
+  final ink = _inkMask(gray, cw, ch, max(8, min(cw, ch) ~/ 25), 12);
+
+  // digit unchai ka andaza: components ki unchai (60th percentile)
+  final cc = _components(ink, cw, ch);
+  final hs = cc.comps
+      .where((c) => c.area >= 6 && c.h >= 4)
+      .map((c) => c.h)
+      .toList()
+    ..sort();
+  final digitH = hs.isEmpty ? 40.0 : hs[(hs.length * 0.6).floor()] * q * 1.0;
+
+  // row projection
+  final rowCnt = List<int>.filled(ch, 0);
+  for (var y = 0; y < ch; y++) {
+    var c = 0;
+    for (var x = 0; x < cw; x++) {
+      c += ink[y * cw + x];
+    }
+    rowCnt[y] = c;
+  }
+  final blankMax = max(1, (cw * 0.004).round());
+  bool blank(int y) => rowCnt[y] <= blankMax;
+
+  // band ki unchai: ~3.2 million pixels per band
+  final targetPx = max(600, 3200000 ~/ work.width);
+  final target = max(8, targetPx ~/ q);
+  final cuts = <int>[];
+  var last = 0;
+  while (ch - last > target * 1.5) {
+    final nominal = last + target;
+    var found = -1;
+    for (var d = 0; d < ch; d++) {
+      final f = nominal + d;
+      final bk = nominal - d;
+      if (f < ch - 1 && blank(f)) {
+        found = f;
+        break;
+      }
+      if (d <= target ~/ 2 && bk > last + target ~/ 2 && blank(bk)) {
+        found = bk;
+        break;
+      }
+      if (f >= ch - 1 && bk <= last) break;
+    }
+    if (found < 0) break;
+    var a = found;
+    var z = found;
+    while (a > last + 1 && blank(a - 1)) {
+      a--;
+    }
+    while (z < ch - 2 && blank(z + 1)) {
+      z++;
+    }
+    final mid = (a + z) ~/ 2;
+    cuts.add(mid * q + q ~/ 2);
+    last = mid;
+  }
+  return _Plan(digitH, cuts);
+}
+
+/// Ek band (ya poori chhoti image) scan karta hai.
+/// rad = threshold window (0 = auto), minAreaIn = chhote noise ki had (0 = auto)
+_Band _scanBand(
+    img.Image im, int radIn, int minAreaIn, int lineBase, int numBase) {
+  final w = im.width;
+  final h = im.height;
+  final gray = _gray(im);
+  final rad = radIn > 0 ? radIn : max(15, min(w, h) ~/ 25);
+  final ink = _inkMask(gray, w, h, rad, 15);
+  final cc = _components(ink, w, h);
+  final labels = cc.labels;
+
+  // Noise / lines / borders filter
+  final minArea =
+      minAreaIn > 0 ? minAreaIn : max(25, (w * h * 0.00003).round());
+  var cand = cc.comps
       .where((c) => c.area >= minArea && c.w <= w * 0.5 && c.h <= h * 0.5)
       .toList();
-  if (cand.isEmpty) return ScanResult(preview, w, h, []);
+  if (cand.isEmpty) return _Band([], 0, numBase);
   final hs = cand.map((c) => c.h).toList()..sort();
   final medH = hs[hs.length ~/ 2].toDouble();
   cand = cand.where((c) => c.h >= medH * 0.35).toList();
-  if (cand.isEmpty) return ScanResult(preview, w, h, []);
+  if (cand.isEmpty) return _Band([], 0, numBase);
 
-  // 5) Lines (upar se neeche)
+  // Lines (upar se neeche)
   cand.sort((a, b) => a.cy.compareTo(b.cy));
   final lines = <List<_Comp>>[];
   final lineCy = <double>[];
@@ -199,7 +360,7 @@ ScanResult processScan(ScanRequest req) {
     }
   }
 
-  // 6) Har line mein toote hue strokes jodo (4, 5, 7...)
+  // Har line mein toote hue strokes jodo (4, 5, 7...)
   final rows = <List<_Comp>>[];
   for (final line in lines) {
     final row = line..sort((a, b) => a.l.compareTo(b.l));
@@ -220,24 +381,24 @@ ScanResult processScan(ScanRequest req) {
   final gh = rows.expand((r) => r).map((g) => g.h).toList()..sort();
   final medG = gh[gh.length ~/ 2].toDouble();
 
-  // 7) Numbers banao. Jo digit jaisa na lage (chorra/ lamba/ dash/ naam) reject.
+  // Numbers banao. Jo digit jaisa na lage (chhota/ lamba/ dash/ naam) reject.
   final glyphs = <ScanGlyph>[];
-  var numberId = -1;
+  var numberId = numBase;
   for (var li = 0; li < rows.length; li++) {
     _Comp? prev;
     for (final g in rows[li]) {
       final bad = g.w / g.h > 1.3 || g.h < medG * 0.5 || g.h > medG * 2.2;
       if (bad) {
-        glyphs.add(
-            ScanGlyph(Float32List(784), li, -1, g.l, g.t, g.r, g.b, true));
+        glyphs.add(ScanGlyph(
+            Float32List(784), lineBase + li, -1, g.l, g.t, g.r, g.b, true));
         continue;
       }
       if (prev == null || g.l - prev.r > medG * 0.7) numberId++;
-      glyphs.add(_renderGlyph(g, labels, w, li, numberId));
+      glyphs.add(_renderGlyph(g, labels, w, lineBase + li, numberId));
       prev = g;
     }
   }
-  return ScanResult(preview, w, h, glyphs);
+  return _Band(glyphs, rows.length, numberId);
 }
 
 /// Ek digit ko MNIST style 28x28 mein badalta hai:
