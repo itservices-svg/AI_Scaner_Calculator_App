@@ -25,11 +25,17 @@ const _opSymbols = {
   ScanOp.div: ' ÷ ',
 };
 
+// glyph ki halat: 0 = pakka, 1 = shak, 2 = reject (digit nahi)
+const _okConf = 0.8;
+const _rejectConf = 0.5;
+
 class _Entry {
   final TextEditingController ctrl;
   final bool low; // model ko yaqeen kam tha
   _Entry(String text, this.low) : ctrl = TextEditingController(text: text);
 }
+
+double _c01(double v) => v < 0 ? 0 : (v > 1 ? 1 : v);
 
 class ScanPage extends StatefulWidget {
   final DigitRecognizer recognizer;
@@ -43,8 +49,16 @@ class _ScanPageState extends State<ScanPage> {
   final _picker = ImagePicker();
   bool busy = false;
   String? error;
+
+  // photo + crop
+  Uint8List? srcBytes;
+  PreparedImage? prepared;
+  bool cropping = false;
+  Offset? cropA, cropB; // fractions 0..1
+
+  // result
   ScanResult? scan;
-  List<bool> glyphLow = [];
+  List<int> glyphState = [];
   List<_Entry> entries = [];
   ScanOp op = ScanOp.sum;
 
@@ -54,6 +68,13 @@ class _ScanPageState extends State<ScanPage> {
       e.ctrl.dispose();
     }
     super.dispose();
+  }
+
+  void _clearEntries() {
+    for (final e in entries) {
+      e.ctrl.dispose();
+    }
+    entries = [];
   }
 
   Future<void> _pick(ImageSource source) async {
@@ -69,17 +90,69 @@ class _ScanPageState extends State<ScanPage> {
         error = null;
       });
       final bytes = await file.readAsBytes();
-      final res = await compute(processScan, bytes);
+      final prep = await compute(prepareScan, bytes);
+      if (!mounted) return;
+      setState(() {
+        srcBytes = bytes;
+        prepared = prep;
+        cropping = true;
+        cropA = null;
+        cropB = null;
+        scan = null;
+        glyphState = [];
+        _clearEntries();
+        busy = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        busy = false;
+        error = 'Photo nahi khul saki: $e';
+      });
+    }
+  }
 
-      final lows = <bool>[];
+  Future<void> _runScan({required bool fullPage}) async {
+    final bytes = srcBytes;
+    if (bytes == null) return;
+    var l = 0.0, t = 0.0, r = 1.0, b = 1.0;
+    final a = cropA, c = cropB;
+    if (!fullPage && a != null && c != null) {
+      l = a.dx < c.dx ? a.dx : c.dx;
+      r = a.dx < c.dx ? c.dx : a.dx;
+      t = a.dy < c.dy ? a.dy : c.dy;
+      b = a.dy < c.dy ? c.dy : a.dy;
+      if (r - l < 0.03 || b - t < 0.03) {
+        l = 0;
+        t = 0;
+        r = 1;
+        b = 1;
+      }
+    }
+    try {
+      setState(() {
+        busy = true;
+        error = null;
+      });
+      final res = await compute(processScan, ScanRequest(bytes, l, t, r, b));
+
+      final states = <int>[];
       final found = <_Entry>[];
       var curId = -1;
       StringBuffer? sb;
       var curLow = false;
       for (final g in res.glyphs) {
+        if (g.rejected) {
+          states.add(2);
+          continue;
+        }
         final (digit, conf) = widget.recognizer.classify(g.pixels);
-        final isLow = conf < 0.8;
-        lows.add(isLow);
+        if (conf < _rejectConf) {
+          states.add(2);
+          continue;
+        }
+        final isLow = conf < _okConf;
+        states.add(isLow ? 1 : 0);
         if (g.numberId != curId) {
           final done = sb;
           if (done != null) found.add(_Entry(done.toString(), curLow));
@@ -94,17 +167,16 @@ class _ScanPageState extends State<ScanPage> {
       if (last != null) found.add(_Entry(last.toString(), curLow));
 
       if (!mounted) return;
-      for (final e in entries) {
-        e.ctrl.dispose();
-      }
       setState(() {
+        _clearEntries();
         scan = res;
-        glyphLow = lows;
+        glyphState = states;
         entries = found;
+        cropping = false;
         busy = false;
         if (found.isEmpty) {
-          error = 'Koi number nahi mila. Saaf kaagaz, achhi roshni mein, '
-              'bara likh kar dobara try karo.';
+          error = 'Koi number nahi mila. Sirf numbers wale hissay ka box '
+              'chuno, bara likho, aur saaf roshni mein photo lo.';
         }
       });
     } catch (e) {
@@ -166,6 +238,7 @@ class _ScanPageState extends State<ScanPage> {
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     final s = scan;
+    final prep = prepared;
     return Scaffold(
       appBar: AppBar(title: const Text('Scan Calculator')),
       body: SafeArea(
@@ -205,92 +278,169 @@ class _ScanPageState extends State<ScanPage> {
               const SizedBox(height: 12),
               Text(error!, style: TextStyle(color: cs.error)),
             ],
-            if (s != null) ...[
-              const SizedBox(height: 12),
-              ClipRRect(
-                borderRadius: BorderRadius.circular(12),
-                child: AspectRatio(
-                  aspectRatio: s.width / s.height,
-                  child: Stack(
-                    fit: StackFit.expand,
-                    children: [
-                      Image.memory(s.previewJpg,
-                          fit: BoxFit.fill, gaplessPlayback: true),
-                      CustomPaint(painter: _BoxPainter(s, glyphLow)),
-                    ],
-                  ),
-                ),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                'Hara = pakka, narangi = shak (check kar lo).',
-                style: Theme.of(context).textTheme.bodySmall,
-              ),
-            ],
-            if (s != null || entries.isNotEmpty) ...[
-              const SizedBox(height: 16),
-              Text('Mile hue numbers (galat ho to theek karo)',
-                  style: Theme.of(context).textTheme.titleSmall),
-              const SizedBox(height: 8),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: [
-                  for (var i = 0; i < entries.length; i++) _entryField(i, cs),
-                  ActionChip(
-                    avatar: const Icon(Icons.add, size: 18),
-                    label: const Text('Number'),
-                    onPressed: () =>
-                        setState(() => entries.add(_Entry('', false))),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 16),
-              Wrap(
-                spacing: 8,
-                runSpacing: 4,
-                children: [
-                  for (final o in ScanOp.values)
-                    ChoiceChip(
-                      label: Text(_opLabels[o]!),
-                      selected: op == o,
-                      onSelected: (_) => setState(() => op = o),
-                    ),
-                ],
-              ),
-              const SizedBox(height: 12),
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(14),
-                decoration: BoxDecoration(
-                  color: cs.surfaceContainerHighest,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: [
-                    if (_expression().isNotEmpty)
-                      Text(_expression(),
-                          textAlign: TextAlign.right,
-                          style: const TextStyle(fontSize: 16)),
-                    Text(
-                      '= ${_result()}',
-                      style: TextStyle(
-                        fontSize: 34,
-                        fontWeight: FontWeight.bold,
-                        color: cs.primary,
-                      ),
-                    ),
-                    Text('${_values.length} numbers',
-                        style: Theme.of(context).textTheme.bodySmall),
-                  ],
-                ),
-              ),
-            ],
+            if (cropping && prep != null) ..._cropSection(prep),
+            if (!cropping && s != null) ..._resultSection(s, cs),
           ],
         ),
       ),
     );
+  }
+
+  List<Widget> _cropSection(PreparedImage prep) {
+    final a = cropA, b = cropB;
+    final rect = (a != null && b != null) ? Rect.fromPoints(a, b) : null;
+    return [
+      const SizedBox(height: 16),
+      Text(
+        'Sirf numbers wale hissay par ungli se box banao '
+        '(naam, lines, signs chhod do).',
+        style: Theme.of(context).textTheme.titleSmall,
+      ),
+      const SizedBox(height: 8),
+      ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: AspectRatio(
+          aspectRatio: prep.width / prep.height,
+          child: LayoutBuilder(
+            builder: (context, box) {
+              Offset frac(Offset p) =>
+                  Offset(_c01(p.dx / box.maxWidth), _c01(p.dy / box.maxHeight));
+              return GestureDetector(
+                onPanStart: (d) => setState(() {
+                  cropA = frac(d.localPosition);
+                  cropB = cropA;
+                }),
+                onPanUpdate: (d) =>
+                    setState(() => cropB = frac(d.localPosition)),
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    Image.memory(prep.jpg,
+                        fit: BoxFit.fill, gaplessPlayback: true),
+                    CustomPaint(painter: _CropPainter(rect)),
+                  ],
+                ),
+              );
+            },
+          ),
+        ),
+      ),
+      const SizedBox(height: 12),
+      Row(
+        children: [
+          Expanded(
+            child: OutlinedButton(
+              onPressed: busy ? null : () => _runScan(fullPage: true),
+              child: const Text('Poora page'),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: FilledButton.icon(
+              onPressed: busy ? null : () => _runScan(fullPage: false),
+              icon: const Icon(Icons.document_scanner),
+              label: const Text('Scan karo'),
+            ),
+          ),
+        ],
+      ),
+    ];
+  }
+
+  List<Widget> _resultSection(ScanResult s, ColorScheme cs) {
+    return [
+      const SizedBox(height: 12),
+      ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: AspectRatio(
+          aspectRatio: s.width / s.height,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              Image.memory(s.previewJpg,
+                  fit: BoxFit.fill, gaplessPlayback: true),
+              CustomPaint(painter: _BoxPainter(s, glyphState)),
+            ],
+          ),
+        ),
+      ),
+      const SizedBox(height: 4),
+      Text(
+        'Hara = pakka, narangi = shak (check kar lo), laal = digit nahi '
+        '(shamil nahi kiya).',
+        style: Theme.of(context).textTheme.bodySmall,
+      ),
+      if (srcBytes != null)
+        Align(
+          alignment: Alignment.centerLeft,
+          child: TextButton.icon(
+            onPressed: () => setState(() {
+              cropping = true;
+              cropA = null;
+              cropB = null;
+            }),
+            icon: const Icon(Icons.crop),
+            label: const Text('Hissa dobara chuno'),
+          ),
+        ),
+      const SizedBox(height: 8),
+      Text('Mile hue numbers (galat ho to theek karo)',
+          style: Theme.of(context).textTheme.titleSmall),
+      const SizedBox(height: 8),
+      Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: [
+          for (var i = 0; i < entries.length; i++) _entryField(i, cs),
+          ActionChip(
+            avatar: const Icon(Icons.add, size: 18),
+            label: const Text('Number'),
+            onPressed: () => setState(() => entries.add(_Entry('', false))),
+          ),
+        ],
+      ),
+      const SizedBox(height: 16),
+      Wrap(
+        spacing: 8,
+        runSpacing: 4,
+        children: [
+          for (final o in ScanOp.values)
+            ChoiceChip(
+              label: Text(_opLabels[o]!),
+              selected: op == o,
+              onSelected: (_) => setState(() => op = o),
+            ),
+        ],
+      ),
+      const SizedBox(height: 12),
+      Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: cs.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            if (_expression().isNotEmpty)
+              Text(_expression(),
+                  textAlign: TextAlign.right,
+                  style: const TextStyle(fontSize: 16)),
+            Text(
+              '= ${_result()}',
+              style: TextStyle(
+                fontSize: 34,
+                fontWeight: FontWeight.bold,
+                color: cs.primary,
+              ),
+            ),
+            Text('${_values.length} numbers',
+                style: Theme.of(context).textTheme.bodySmall),
+          ],
+        ),
+      ),
+    ];
   }
 
   Widget _entryField(int i, ColorScheme cs) {
@@ -324,10 +474,39 @@ class _ScanPageState extends State<ScanPage> {
   }
 }
 
+class _CropPainter extends CustomPainter {
+  final Rect? rect; // fractions
+  _CropPainter(this.rect);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final f = rect;
+    if (f == null) return;
+    final r = Rect.fromLTRB(f.left * size.width, f.top * size.height,
+        f.right * size.width, f.bottom * size.height);
+    final dim = Path.combine(
+      PathOperation.difference,
+      Path()..addRect(Offset.zero & size),
+      Path()..addRect(r),
+    );
+    canvas.drawPath(dim, Paint()..color = Colors.black54);
+    canvas.drawRect(
+      r,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2
+        ..color = Colors.amber,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _CropPainter old) => old.rect != rect;
+}
+
 class _BoxPainter extends CustomPainter {
   final ScanResult scan;
-  final List<bool> low;
-  _BoxPainter(this.scan, this.low);
+  final List<int> state;
+  _BoxPainter(this.scan, this.state);
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -335,10 +514,13 @@ class _BoxPainter extends CustomPainter {
     final sy = size.height / scan.height;
     for (var i = 0; i < scan.glyphs.length; i++) {
       final g = scan.glyphs[i];
+      final st = i < state.length ? state[i] : 0;
       final paint = Paint()
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 2
-        ..color = (i < low.length && low[i]) ? Colors.orange : Colors.greenAccent;
+        ..strokeWidth = st == 2 ? 1.5 : 2
+        ..color = st == 2
+            ? Colors.redAccent
+            : (st == 1 ? Colors.orange : Colors.greenAccent);
       canvas.drawRect(
         Rect.fromLTRB(g.left * sx, g.top * sy, (g.right + 1) * sx,
             (g.bottom + 1) * sy),
@@ -349,5 +531,5 @@ class _BoxPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _BoxPainter old) =>
-      old.scan != scan || old.low != low;
+      old.scan != scan || old.state != state;
 }

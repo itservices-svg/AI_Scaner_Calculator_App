@@ -9,8 +9,24 @@ class ScanGlyph {
   final int line; // kaun si line (upar se neeche)
   final int numberId; // kaun sa number (reading order)
   final int left, top, right, bottom; // preview image ke coordinates
+  final bool rejected; // digit jaisi shakal nahi (naam, line, dash...)
   ScanGlyph(this.pixels, this.line, this.numberId, this.left, this.top,
-      this.right, this.bottom);
+      this.right, this.bottom,
+      [this.rejected = false]);
+}
+
+/// Crop chunne ke liye photo ka resized version.
+class PreparedImage {
+  final Uint8List jpg;
+  final int width, height;
+  PreparedImage(this.jpg, this.width, this.height);
+}
+
+/// Scan ki request: photo + crop rect (0..1 fractions; poora page = 0,0,1,1).
+class ScanRequest {
+  final Uint8List bytes;
+  final double l, t, r, b;
+  ScanRequest(this.bytes, this.l, this.t, this.r, this.b);
 }
 
 class ScanResult {
@@ -40,17 +56,45 @@ class _Comp {
   }
 }
 
-/// Top-level function taake `compute()` se background isolate mein chal sake.
-ScanResult processScan(Uint8List bytes) {
+int _ci(int v, int lo, int hi) => v < lo ? lo : (v > hi ? hi : v);
+
+img.Image _loadResized(Uint8List bytes) {
   var im = img.decodeImage(bytes);
   if (im == null) throw Exception('Image parh nahi sakay');
   im = img.bakeOrientation(im);
-
   const maxSide = 1280;
   if (im.width > maxSide || im.height > maxSide) {
     im = im.width >= im.height
         ? img.copyResize(im, width: maxSide)
         : img.copyResize(im, height: maxSide);
+  }
+  return im;
+}
+
+/// Top-level functions taake `compute()` se background isolate mein chal sakein.
+PreparedImage prepareScan(Uint8List bytes) {
+  final im = _loadResized(bytes);
+  return PreparedImage(
+      Uint8List.fromList(img.encodeJpg(im, quality: 80)), im.width, im.height);
+}
+
+ScanResult processScan(ScanRequest req) {
+  var im = _loadResized(req.bytes);
+  final fw = im.width;
+  final fh = im.height;
+  final x0 = _ci((req.l * fw).round(), 0, fw - 2);
+  final y0 = _ci((req.t * fh).round(), 0, fh - 2);
+  final x1 = _ci((req.r * fw).round(), x0 + 2, fw);
+  final y1 = _ci((req.b * fh).round(), y0 + 2, fh);
+  if (x1 - x0 < fw || y1 - y0 < fh) {
+    im = img.copyCrop(im, x: x0, y: y0, width: x1 - x0, height: y1 - y0);
+  }
+  // chhota crop ho to bara karo taake digits kaafi pixels len
+  final longSide = im.width > im.height ? im.width : im.height;
+  if (longSide < 640) {
+    im = im.width >= im.height
+        ? img.copyResize(im, width: 800)
+        : img.copyResize(im, height: 800);
   }
   final w = im.width;
   final h = im.height;
@@ -155,11 +199,10 @@ ScanResult processScan(Uint8List bytes) {
     }
   }
 
-  // 6) Har line mein: toote hue strokes jodo (4, 5, 7...), phir numbers banao
-  final glyphs = <ScanGlyph>[];
-  var numberId = -1;
-  for (var li = 0; li < lines.length; li++) {
-    final row = lines[li]..sort((a, b) => a.l.compareTo(b.l));
+  // 6) Har line mein toote hue strokes jodo (4, 5, 7...)
+  final rows = <List<_Comp>>[];
+  for (final line in lines) {
+    final row = line..sort((a, b) => a.l.compareTo(b.l));
     final merged = <_Comp>[];
     for (final c in row) {
       if (merged.isNotEmpty) {
@@ -172,9 +215,24 @@ ScanResult processScan(Uint8List bytes) {
       }
       merged.add(c);
     }
+    rows.add(merged);
+  }
+  final gh = rows.expand((r) => r).map((g) => g.h).toList()..sort();
+  final medG = gh[gh.length ~/ 2].toDouble();
+
+  // 7) Numbers banao. Jo digit jaisa na lage (chorra/ lamba/ dash/ naam) reject.
+  final glyphs = <ScanGlyph>[];
+  var numberId = -1;
+  for (var li = 0; li < rows.length; li++) {
     _Comp? prev;
-    for (final g in merged) {
-      if (prev == null || g.l - prev.r > medH * 0.7) numberId++;
+    for (final g in rows[li]) {
+      final bad = g.w / g.h > 1.3 || g.h < medG * 0.5 || g.h > medG * 2.2;
+      if (bad) {
+        glyphs.add(
+            ScanGlyph(Float32List(784), li, -1, g.l, g.t, g.r, g.b, true));
+        continue;
+      }
+      if (prev == null || g.l - prev.r > medG * 0.7) numberId++;
       glyphs.add(_renderGlyph(g, labels, w, li, numberId));
       prev = g;
     }
