@@ -3,6 +3,10 @@ import 'dart:typed_data';
 
 import 'package:image/image.dart' as img;
 
+/// Ek line mein do digits ke darmiyan gap (digit ki unchai ka multiple) is se
+/// kam ho to wo ek hi number hai ("1  20" -> 120). Is se bara gap = alag number.
+const double _numberGap = 1.5;
+
 /// Kaagaz ki photo se nikla hua ek digit (MNIST style 28x28) aur uski jagah.
 class ScanGlyph {
   final Float32List pixels; // 28*28, 0..1, white digit on black
@@ -393,7 +397,7 @@ _Band _scanBand(
             Float32List(784), lineBase + li, -1, g.l, g.t, g.r, g.b, true));
         continue;
       }
-      if (prev == null || g.l - prev.r > medG * 0.7) numberId++;
+      if (prev == null || g.l - prev.r > medG * _numberGap) numberId++;
       glyphs.add(_renderGlyph(g, labels, w, lineBase + li, numberId));
       prev = g;
     }
