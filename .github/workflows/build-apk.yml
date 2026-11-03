@@ -2,7 +2,7 @@ name: Build APK
 
 on:
   push:
-    tags: ['v*']
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -50,8 +50,9 @@ jobs:
           path: HandWriteAI.apk
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: HandWrite AI v1.0.${{ github.run_number }}
           files: HandWriteAI.apk
           generate_release_notes: true
