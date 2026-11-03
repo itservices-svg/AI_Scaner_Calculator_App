@@ -10,6 +10,8 @@ dependencies:
   flutter:
     sdk: flutter
   tflite_flutter: ^0.12.1
+  image: ^4.2.0
+  image_picker: ^1.1.2
 
 dev_dependencies:
   flutter_test:
